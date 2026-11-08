@@ -36,6 +36,11 @@ pub(super) fn load_settings(path: &Path, dock: &mut Dock, menu: &mut CheatMenu, 
                     cheats.perfect = perfect;
                 }
             }
+            Some(("shiny", value)) => {
+                if use_saved_cheats {
+                    cheats.shiny = value == "1";
+                }
+            }
             _ => {}
         }
     }
@@ -46,14 +51,15 @@ pub(super) fn load_settings(path: &Path, dock: &mut Dock, menu: &mut CheatMenu, 
 
 pub(super) fn save_settings(path: &Path, dock: &Dock, menu: &CheatMenu, cheats: &Cheats) {
     let text = format!(
-        "volume={:.2}\nmuted={}\nspeed={}\nwild={}@{}\nwild_on={}\nperfect={}\n",
+        "volume={:.2}\nmuted={}\nspeed={}\nwild={}@{}\nwild_on={}\nperfect={}\nshiny={}\n",
         dock.volume(),
         dock.is_muted() as u8,
         dock.speed().label(),
         menu.choice().species,
         menu.choice().level,
         menu.wild_on() as u8,
-        cheats.perfect.key()
+        cheats.perfect.key(),
+        cheats.shiny as u8
     );
     let _ = std::fs::write(path, text);
 }
@@ -70,6 +76,7 @@ mod tests {
     fn cheat_choices_survive_a_restart() {
         let path = temp_file("roundtrip");
         let mut cheats = Cheats::new(None, Perfect::Both);
+        cheats.shiny = true;
         let mut menu = CheatMenu::default();
         menu.set(WildMon::new(143, 50), true, &mut cheats);
         save_settings(&path, &Dock::new(0.5), &menu, &cheats);
@@ -79,6 +86,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(loaded.wild, Some(WildMon::new(143, 50)));
         assert_eq!(loaded.perfect, Perfect::Both);
+        assert!(loaded.shiny);
         assert_eq!(loaded_menu.choice(), WildMon::new(143, 50));
     }
 

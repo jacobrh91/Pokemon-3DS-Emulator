@@ -10,7 +10,7 @@ use ds_emulator::frontend;
 use files::{new_console, save_path, state_path};
 use headless::{HeadlessOptions, parse_script_input, run_headless};
 
-const USAGE: &str = "usage: ds_emulator [--info] [--frames <n> [--screenshot <file.png>] [--wav <file.wav>] [--load-state <file>] [--save-state <file>] [--tap <x>,<y>@<frame>]... [--press <button>@<frame>]...] [--wild <species>@<level>] [--perfect <wild|opponents|both>] <rom.nds>";
+const USAGE: &str = "usage: ds_emulator [--info] [--frames <n> [--screenshot <file.png>] [--wav <file.wav>] [--load-state <file>] [--save-state <file>] [--tap <x>,<y>@<frame>]... [--press <button>@<frame>]...] [--wild <species>@<level>] [--perfect <wild|opponents|both>] [--shiny] <rom.nds>";
 
 fn main() -> ExitCode {
     match run() {
@@ -44,6 +44,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--tap" => script.push(parse_script_input(&args.next().ok_or(USAGE)?, true)?),
             "--press" => script.push(parse_script_input(&args.next().ok_or(USAGE)?, false)?),
             "--wild" => cheats.wild = Some(parse_wild(&args.next().ok_or(USAGE)?)?),
+            "--shiny" => cheats.shiny = true,
             "--perfect" => {
                 let choice = args.next().ok_or(USAGE)?;
                 cheats.perfect = Perfect::from_key(&choice).ok_or_else(|| format!("unknown --perfect choice {choice:?}"))?;

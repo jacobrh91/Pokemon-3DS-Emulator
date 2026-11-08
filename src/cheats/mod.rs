@@ -7,6 +7,7 @@
 //! | Wild Pokémon is *species* at level *n* | the two wild-encounter routines | `r0` (species), `r1` (level) at entry |
 //! | Perfect stats, wild | `CreateMon` and its two variants, when the wild routines call them | `r3` (`fixed_iv`) |
 //! | Perfect stats, opponents | `CreateBoxMon` for Pokémon with OT-ID type 2 | `r3` (`fixed_iv`) |
+//! | Shiny wild Pokémon | `CreateMon`, when the wild routines call it | the personality argument on the stack |
 //!
 //! # How the game makes a Pokémon
 //!
@@ -22,6 +23,15 @@
 //! Two routines in the field overlay build every wild encounter (grass, surfing, fishing, ...):
 //! both take the species in `r0` and the level in `r1` and call one of the `CreateMon` variants
 //! with `fixed_iv` 32. A `CreateMon` whose caller lies inside them is therefore a wild Pokémon.
+//!
+//! # Shiny
+//!
+//! A Pokémon is shiny when `TID ^ SID ^ PID_high ^ PID_low < 8`. The wild routines draw a
+//! personality and call `CreateMon` with it fixed, either themselves (with the player's trainer
+//! ID preset) or through the two variants (which leave the ID to the caller, who stores it
+//! afterwards from a structure its `r7` points to). The hook on `CreateMon` swaps in a
+//! personality that makes the sum zero, keeping the low byte (gender, ability) and the nature
+//! (`PID % 25`). For the variants it learns the ID at their entry, from `r7`.
 //!
 //! # Finding the code
 //!
@@ -48,6 +58,11 @@ const SCAN_INTERVAL: u64 = 60;
 /// How far into the second wild routine its `CreateMon` calls reach.
 const WILD_SECOND_EXTENT: u32 = 0x150;
 const RAM_BASE: u32 = 0x0200_0000;
+/// OT-ID type of a Pokémon whose trainer ID is passed in, as the wild routines do.
+const OT_ID_PRESET: u32 = 1;
+const UNOWN: u32 = 201;
+/// How far into each `CreateMon` variant its call to `CreateMon` lies.
+const VARIANT_EXTENT: u32 = 0xA0;
 
 /// An array of bytes to match: numbers match themselves and `_` any byte.
 macro_rules! pattern {
@@ -186,14 +201,18 @@ impl Default for WildMon {
 pub struct Cheats {
     pub wild: Option<WildMon>,
     pub perfect: Perfect,
+    /// Make the wild Pokémon shiny.
+    pub shiny: bool,
     /// Where each routine was last found.
     found: [Option<u32>; Kind::ALL.len()],
     next_scan: u64,
+    /// The trainer ID of the wild Pokémon a `CreateMon` variant is making.
+    pending_ot_id: std::cell::Cell<Option<u32>>,
 }
 
 impl Default for Cheats {
     fn default() -> Cheats {
-        Cheats { wild: None, perfect: Perfect::Off, found: [None; Kind::ALL.len()], next_scan: 0 }
+        Cheats { wild: None, perfect: Perfect::Off, shiny: false, found: [None; Kind::ALL.len()], next_scan: 0, pending_ot_id: Default::default() }
     }
 }
 
@@ -215,13 +234,35 @@ fn find_all(ram: &[u8], pattern: Pattern) -> Vec<u32> {
         .collect()
 }
 
+/// Whether `TID ^ SID ^ PID_high ^ PID_low < 8`.
+fn is_shiny(personality: u32, ot_id: u32) -> bool {
+    (ot_id ^ (ot_id >> 16) ^ personality ^ (personality >> 16)) & 0xFFFF < 8
+}
+
+/// A shiny personality close to `personality`: the same low byte and nature, or `None` if it
+/// is shiny already.
+fn shiny_personality(personality: u32, ot_id: u32) -> Option<u32> {
+    if is_shiny(personality, ot_id) {
+        return None;
+    }
+    let nature = personality % 25;
+    let id = (ot_id ^ (ot_id >> 16)) & 0xFFFF;
+    (0..0x100u32)
+        .flat_map(|byte| (0..8u32).map(move |low| (byte, low)))
+        .map(|(byte, low)| {
+            let lower = (personality & 0xFF) | byte << 8;
+            (id ^ lower ^ low) << 16 | lower
+        })
+        .find(|&candidate| candidate % 25 == nature)
+}
+
 impl Cheats {
     pub fn new(wild: Option<WildMon>, perfect: Perfect) -> Cheats {
         Cheats { wild, perfect, ..Cheats::default() }
     }
 
     pub fn is_active(&self) -> bool {
-        self.wild.is_some() || self.perfect != Perfect::Off
+        self.wild.is_some() || self.perfect != Perfect::Off || self.shiny
     }
 
     fn address(&self, kind: Kind) -> Option<u32> {
@@ -263,16 +304,16 @@ impl Cheats {
         Kind::ALL.into_iter().filter(move |kind| match kind {
             Kind::WildFirst | Kind::WildSecond => self.wild.is_some(),
             Kind::CreateBoxMon => self.perfect.covers_opponents(),
-            _ => self.perfect.covers_wild() && wild_code,
+            _ => (self.perfect.covers_wild() || self.shiny) && wild_code,
         })
     }
 
     /// The routines the options need found, in order.
     fn wanted(&self) -> impl Iterator<Item = Kind> + '_ {
         Kind::ALL.into_iter().filter(|kind| match kind {
-            Kind::WildFirst | Kind::WildSecond => self.wild.is_some() || self.perfect.covers_wild(),
+            Kind::WildFirst | Kind::WildSecond => self.wild.is_some() || self.perfect.covers_wild() || self.shiny,
             Kind::CreateBoxMon => self.perfect.covers_opponents(),
-            _ => self.perfect.covers_wild(),
+            _ => self.perfect.covers_wild() || self.shiny,
         })
     }
 
@@ -293,6 +334,31 @@ impl Cheats {
         let first = self.address(Kind::WildFirst)?;
         let second = self.address(Kind::WildSecond)?;
         Some(first.min(second)..first.max(second) + WILD_SECOND_EXTENT)
+    }
+
+    /// Replace the personality `CreateMon` was given by one that is shiny for the trainer ID it
+    /// was given. Only calls that fix both (as the first wild routine does) are touched.
+    fn make_shiny(&self, cpu: &Cpu, hw: &mut Hardware, ot_id: Option<u32>) {
+        let sp = cpu.regs[13];
+        let [fixed, personality, ot_id_type, passed_ot_id] = [0, 4, 8, 12].map(|at| hw.read(ARM9, sp.wrapping_add(at), 4));
+        let (wanted_type, ot_id) = match ot_id {
+            Some(ot_id) => (0, ot_id),
+            None => (OT_ID_PRESET, passed_ot_id),
+        };
+        if fixed != 1 || ot_id_type != wanted_type || cpu.regs[1] == UNOWN {
+            return;
+        }
+        if let Some(shiny) = shiny_personality(personality, ot_id) {
+            hw.write(ARM9, sp.wrapping_add(4), 4, shiny);
+        }
+    }
+
+    /// Whether `lr` lies in one of the `CreateMon` variants.
+    fn called_by_variant(&self, lr: u32) -> bool {
+        [Kind::CreateMonNature, Kind::CreateMonPersonality]
+            .into_iter()
+            .filter_map(|kind| self.address(kind))
+            .any(|at| (at..at + VARIANT_EXTENT).contains(&lr))
     }
 
     /// The ARM9 reached a hooked address: change what the game is about to do.
@@ -318,8 +384,21 @@ impl Cheats {
             }
             kind if kind.is_create_mon() => {
                 let called_by_wild_code = self.wild_code().is_some_and(|code| code.contains(&cpu.regs[14]));
-                if self.perfect.covers_wild() && called_by_wild_code {
-                    cpu.regs[3] = PERFECT_IV;
+                if called_by_wild_code {
+                    if self.perfect.covers_wild() {
+                        cpu.regs[3] = PERFECT_IV;
+                    }
+                    if self.shiny {
+                        match kind {
+                            // The caller of a variant keeps the trainer ID in a structure `r7` points to.
+                            Kind::CreateMon => self.make_shiny(cpu, hw, None),
+                            _ => self.pending_ot_id.set(Some(hw.read(ARM9, cpu.regs[7], 4))),
+                        }
+                    }
+                } else if kind == Kind::CreateMon && self.shiny && self.called_by_variant(cpu.regs[14]) {
+                    if let Some(ot_id) = self.pending_ot_id.take() {
+                        self.make_shiny(cpu, hw, Some(ot_id));
+                    }
                 }
             }
             _ => {}

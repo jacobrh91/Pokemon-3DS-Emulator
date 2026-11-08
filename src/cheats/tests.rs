@@ -186,3 +186,93 @@ fn turning_a_cheat_off_removes_its_hooks() {
     cheats.refresh(1, &mut jit, &mut hw);
     assert!(jit.hooks.is_empty());
 }
+
+fn wild_create_mon(cheats: &Cheats, hw: &mut Hardware, personality: u32, ot_id: u32, species: u32) -> u32 {
+    let mut cpu = cpu();
+    cpu.regs[13] = 0x0210_0000;
+    cpu.regs[14] = WILD_FIRST_AT + 0x40;
+    cpu.regs[1] = species;
+    for (at, value) in [(0, 1), (4, personality), (8, OT_ID_PRESET), (12, ot_id)] {
+        hw.write(ARM9, cpu.regs[13] + at, 4, value);
+    }
+    cheats.fire(CREATE_MON_AT, &mut cpu, hw);
+    hw.read(ARM9, cpu.regs[13] + 4, 4)
+}
+
+#[test]
+fn shiny_personalities_keep_the_nature_and_low_byte() {
+    for (personality, ot_id) in [(0x792D_497E, 0xD5E9_60F3), (0x1234_5678, 0), (0xFFFF_FFFF, 0xABCD_EF01), (0x1111_0000, 0xFFFF_0000)] {
+        let shiny = shiny_personality(personality, ot_id).expect("not shiny yet");
+        assert!(is_shiny(shiny, ot_id), "{shiny:#x} for {ot_id:#x}");
+        assert_eq!(shiny % 25, personality % 25);
+        assert_eq!(shiny & 0xFF, personality & 0xFF);
+    }
+    let shiny = shiny_personality(0x792D_497E, 0xD5E9_60F3).unwrap();
+    assert_eq!(shiny_personality(shiny, 0xD5E9_60F3), None, "already shiny");
+}
+
+#[test]
+fn wild_pokemon_get_a_shiny_personality() {
+    let mut hw = game_with_all_routines();
+    let mut cheats = Cheats::default();
+    cheats.shiny = true;
+    let _jit = refreshed(&mut cheats, &mut hw);
+    let ot_id = 0xD5E9_60F3;
+    let personality = wild_create_mon(&cheats, &mut hw, 0x792D_497E, ot_id, 143);
+    assert!(is_shiny(personality, ot_id));
+    assert_eq!(personality % 25, 0x792D_497E % 25);
+    assert_eq!(wild_create_mon(&cheats, &mut hw, 0x792D_497E, ot_id, UNOWN), 0x792D_497E, "Unown keeps its letter");
+}
+
+#[test]
+fn shiny_is_left_off_unless_asked_for_and_only_for_wild_callers() {
+    let mut hw = game_with_all_routines();
+    let mut off = Cheats::default();
+    off.perfect = Perfect::Wild;
+    let _jit = refreshed(&mut off, &mut hw);
+    assert_eq!(wild_create_mon(&off, &mut hw, 0x792D_497E, 0xD5E9_60F3, 143), 0x792D_497E);
+
+    let mut cheats = Cheats::default();
+    cheats.shiny = true;
+    let _jit = refreshed(&mut cheats, &mut hw);
+    let mut cpu = cpu();
+    cpu.regs[13] = 0x0210_0000;
+    cpu.regs[14] = 0x0200_1000;
+    for (at, value) in [(0, 1), (4, 0x792D_497E), (8, OT_ID_PRESET), (12, 0xD5E9_60F3)] {
+        hw.write(ARM9, cpu.regs[13] + at, 4, value);
+    }
+    cheats.fire(CREATE_MON_AT, &mut cpu, &mut hw);
+    assert_eq!(hw.read(ARM9, cpu.regs[13] + 4, 4), 0x792D_497E, "a gift or a trainer's");
+}
+
+#[test]
+fn shiny_works_through_the_create_mon_variants_using_the_trainer_id_in_r7() {
+    let mut hw = game_with_all_routines();
+    let mut cheats = Cheats::default();
+    cheats.shiny = true;
+    let _jit = refreshed(&mut cheats, &mut hw);
+    let ot_id = 0xD5E9_60F3;
+    hw.write(ARM9, 0x0210_8000, 4, ot_id);
+
+    let mut variant = cpu();
+    variant.regs[7] = 0x0210_8000;
+    variant.regs[14] = WILD_SECOND_AT + 0x80;
+    cheats.fire(PERSONALITY_AT, &mut variant, &mut hw);
+
+    let mut create = cpu();
+    create.regs[13] = 0x0210_0000;
+    create.regs[14] = PERSONALITY_AT + 0x96;
+    create.regs[1] = 143;
+    for (at, value) in [(0, 1), (4, 0x792D_497E), (8, 0), (12, 0)] {
+        hw.write(ARM9, create.regs[13] + at, 4, value);
+    }
+    cheats.fire(CREATE_MON_AT, &mut create, &mut hw);
+    let personality = hw.read(ARM9, create.regs[13] + 4, 4);
+    assert!(is_shiny(personality, ot_id));
+    assert_eq!(personality % 25, 0x792D_497E % 25);
+
+    // The ID is used once: a later call that did not come through a wild routine is untouched.
+    hw.write(ARM9, create.regs[13] + 4, 4, 0x792D_497E);
+    cheats.fire(CREATE_MON_AT, &mut create, &mut hw);
+    assert_eq!(hw.read(ARM9, create.regs[13] + 4, 4), 0x792D_497E);
+}

@@ -25,10 +25,11 @@ pub enum Row {
     Species,
     Level,
     Perfect,
+    Shiny,
 }
 
 impl Row {
-    const ALL: [Row; 4] = [Row::Wild, Row::Species, Row::Level, Row::Perfect];
+    const ALL: [Row; 5] = [Row::Wild, Row::Species, Row::Level, Row::Perfect, Row::Shiny];
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,19 +127,21 @@ impl CheatMenu {
                 self.choice = WildMon::new(self.choice.species, next as u8);
             }
             Row::Perfect => cheats.perfect = cheats.perfect.stepped(step),
+            Row::Shiny => cheats.shiny = !cheats.shiny,
         }
         self.sync(cheats);
         true
     }
 
     /// The text of each row: its label and its value.
-    fn lines(&self, cheats: &Cheats) -> [(&'static str, String); 4] {
+    fn lines(&self, cheats: &Cheats) -> [(&'static str, String); 5] {
         let name = species::name(self.choice.species).unwrap_or("").to_uppercase();
         [
             ("WILD POKEMON CHEAT", if self.wild_on { "ON" } else { "OFF" }.to_string()),
             ("SPECIES", format!("{} {}", self.choice.species, name)),
             ("LEVEL", self.choice.level.to_string()),
             ("PERFECT STATS", cheats.perfect.label().to_string()),
+            ("SHINY WILD POKEMON", if cheats.shiny { "ON" } else { "OFF" }.to_string()),
         ]
     }
 
@@ -233,7 +236,7 @@ mod tests {
     fn the_perfect_row_steps_through_the_choices() {
         let mut cheats = Cheats::default();
         let mut menu = CheatMenu::default();
-        press(&mut menu, &mut cheats, &[MenuKey::Up]);
+        press(&mut menu, &mut cheats, &[MenuKey::Up, MenuKey::Up]);
         assert_eq!(menu.selected(), Row::Perfect);
         menu.press(MenuKey::Right, &mut cheats);
         assert_eq!(cheats.perfect, Perfect::Wild);
@@ -242,6 +245,17 @@ mod tests {
         menu.press(MenuKey::Left, &mut cheats);
         menu.press(MenuKey::Left, &mut cheats);
         assert_eq!(cheats.perfect, Perfect::Off);
+    }
+
+    #[test]
+    fn the_shiny_row_switches_the_cheat_on_and_off() {
+        let mut cheats = Cheats::default();
+        let mut menu = CheatMenu::default();
+        press(&mut menu, &mut cheats, &[MenuKey::Up, MenuKey::Toggle]);
+        assert_eq!(menu.selected(), Row::Shiny);
+        assert!(cheats.shiny);
+        menu.press(MenuKey::Left, &mut cheats);
+        assert!(!cheats.shiny);
     }
 
     #[test]
