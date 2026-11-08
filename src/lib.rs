@@ -10,6 +10,7 @@
 
 pub mod capture;
 pub mod cartridge;
+pub mod cheats;
 pub mod cpu;
 pub mod frontend;
 pub mod jit;

@@ -47,6 +47,7 @@ impl Nds {
         loaded.hw.refresh_timers_on(0);
         loaded.hw.refresh_timers_on(1);
         loaded.jit = std::mem::take(&mut self.jit);
+        loaded.cheats = std::mem::take(&mut self.cheats);
         loaded.jit.flush(&mut loaded.hw);
         *self = loaded;
         Ok(())

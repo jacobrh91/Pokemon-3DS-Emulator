@@ -51,6 +51,20 @@ impl CodeMemory {
         }
     }
 
+    /// Overwrite instruction words at the given addresses.
+    pub fn patch(&mut self, patches: &[(usize, u32)]) {
+        unsafe {
+            libc::pthread_jit_write_protect_np(0);
+            for &(at, word) in patches {
+                std::ptr::write(at as *mut u32, word);
+            }
+            libc::pthread_jit_write_protect_np(1);
+            for &(at, _) in patches {
+                sys_icache_invalidate(at as *mut c_void, 4);
+            }
+        }
+    }
+
     /// Forget everything compiled so far.
     pub fn reset(&mut self) {
         self.used = 0;

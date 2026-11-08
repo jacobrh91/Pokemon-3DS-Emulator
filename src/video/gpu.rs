@@ -47,6 +47,15 @@ impl Engine<'_> {
         self.map.lookup(region, off).map_or(0, |i| self.vram[i])
     }
 
+    /// `N` bytes starting at `off` with one bank lookup. They must not straddle a bank
+    /// boundary, which naturally aligned fetches of 2, 4 or 8 bytes never do.
+    fn vram_chunk<const N: usize>(&self, region: Region, off: usize) -> [u8; N] {
+        match self.map.lookup(region, off) {
+            Some(i) => self.vram[i..i + N].try_into().unwrap(),
+            None => [0; N],
+        }
+    }
+
     fn vram16(&self, region: Region, off: usize) -> u16 {
         self.vram8(region, off) as u16 | (self.vram8(region, off + 1) as u16) << 8
     }
@@ -203,55 +212,53 @@ fn render_text_bg(e: &Engine, dispcnt: u32, i: usize, line: usize, out: &mut [u1
     let region = e.bg_region();
 
     let y = (line + vofs) & height_mask;
-    let mut cached_tile = usize::MAX;
-    let (mut entry, mut tile_row) = (0usize, [0u8; 8]);
-    for (x, px) in out.iter_mut().enumerate() {
+    let mut x = 0;
+    while x < WIDTH {
+        // One tile's worth of pixels at a time (the first and last may be partial).
         let sx = (x + hofs) & width_mask;
-        let tile_x = sx >> 3;
-        if tile_x != cached_tile {
-            cached_tile = tile_x;
-            let block = match size {
-                1 => sx >> 8,
-                2 => y >> 8,
-                3 => (sx >> 8) + (y >> 8) * 2,
-                _ => 0,
-            };
-            let entry_addr = screen_base + block * 0x800 + ((y & 0xFF) >> 3) * 64 + ((sx & 0xFF) >> 3) * 2;
-            entry = e.vram16(region, entry_addr) as usize;
-            let tile = entry & 0x3FF;
-            let mut py = y & 7;
-            if entry & 0x800 != 0 {
-                py = 7 - py;
-            }
-            if color256 {
-                let base = char_base + tile * 64 + py * 8;
-                for (k, b) in tile_row.iter_mut().enumerate() {
-                    *b = e.vram8(region, base + k);
-                }
-            } else {
-                let base = char_base + tile * 32 + py * 4;
-                for k in 0..4 {
-                    let b = e.vram8(region, base + k);
-                    tile_row[k * 2] = b & 0xF;
-                    tile_row[k * 2 + 1] = b >> 4;
-                }
+        let first = sx & 7;
+        let run = (8 - first).min(WIDTH - x);
+        let block = match size {
+            1 => sx >> 8,
+            2 => y >> 8,
+            3 => (sx >> 8) + (y >> 8) * 2,
+            _ => 0,
+        };
+        let entry_addr = screen_base + block * 0x800 + ((y & 0xFF) >> 3) * 64 + ((sx & 0xFF) >> 3) * 2;
+        let entry = u16::from_le_bytes(e.vram_chunk(region, entry_addr)) as usize;
+        let tile = entry & 0x3FF;
+        let mut py = y & 7;
+        if entry & 0x800 != 0 {
+            py = 7 - py;
+        }
+        let mut tile_row = [0u8; 8];
+        if color256 {
+            tile_row = e.vram_chunk(region, char_base + tile * 64 + py * 8);
+        } else {
+            let packed: [u8; 4] = e.vram_chunk(region, char_base + tile * 32 + py * 4);
+            for (k, b) in packed.into_iter().enumerate() {
+                tile_row[k * 2] = b & 0xF;
+                tile_row[k * 2 + 1] = b >> 4;
             }
         }
-        let mut pxl = sx & 7;
-        if entry & 0x400 != 0 {
-            pxl = 7 - pxl;
+        if u64::from_le_bytes(tile_row) != 0 {
+            let pal = entry >> 12;
+            let flip = entry & 0x400 != 0;
+            for (k, px) in out[x..x + run].iter_mut().enumerate() {
+                let pxl = if flip { 7 - (first + k) } else { first + k };
+                let idx = tile_row[pxl] as usize;
+                if idx == 0 {
+                    continue;
+                }
+                *px = OPAQUE
+                    | if color256 {
+                        if ext_pal { e.bg_ext_color(ext_slot, pal * 256 + idx) } else { e.palette_color(idx) }
+                    } else {
+                        e.palette_color(pal * 16 + idx)
+                    };
+            }
         }
-        let idx = tile_row[pxl] as usize;
-        if idx == 0 {
-            continue;
-        }
-        let pal = entry >> 12;
-        *px = OPAQUE
-            | if color256 {
-                if ext_pal { e.bg_ext_color(ext_slot, pal * 256 + idx) } else { e.palette_color(idx) }
-            } else {
-                e.palette_color(pal * 16 + idx)
-            };
+        x += run;
     }
 }
 
@@ -387,6 +394,8 @@ fn render_sprites(e: &Engine, dispcnt: u32, line: usize, layers: &mut Layers) {
             (0, 0, 0, 0)
         };
 
+        let mut row_key = (usize::MAX, 0);
+        let mut row = [0u8; 8];
         for ix in 0..bw {
             let sx = x0 + ix as i32;
             if !(0..WIDTH as i32).contains(&sx) {
@@ -414,12 +423,20 @@ fn render_sprites(e: &Engine, dispcnt: u32, line: usize, layers: &mut Layers) {
                 (tile + tile_y * 32 + tile_x * if color256 { 2 } else { 1 }) * 32
             };
             let (px, py) = (tx & 7, ty & 7);
-            let idx = if color256 {
-                e.vram8(region, base + py * 8 + px) as usize
-            } else {
-                let b = e.vram8(region, base + py * 4 + px / 2);
-                (if px & 1 != 0 { b >> 4 } else { b & 0xF }) as usize
-            };
+            // The row of the tile this pixel is in; neighbouring pixels share it.
+            if row_key != (base, py) {
+                row_key = (base, py);
+                if color256 {
+                    row = e.vram_chunk(region, base + py * 8);
+                } else {
+                    let packed: [u8; 4] = e.vram_chunk(region, base + py * 4);
+                    for (k, b) in packed.into_iter().enumerate() {
+                        row[k * 2] = b & 0xF;
+                        row[k * 2 + 1] = b >> 4;
+                    }
+                }
+            }
+            let idx = row[px] as usize;
             if idx == 0 {
                 continue;
             }
@@ -468,7 +485,22 @@ fn compose(e: &Engine, dispcnt: u32, line: usize, l: &Layers, bg_on: [bool; 4], 
     let evy = (e.reg(0x54) & 0x1F).min(16) as u32;
     let backdrop = e.palette_color(0);
 
-    for x in 0..WIDTH {
+    // The enabled backgrounds, front to back. A sprite goes in front of the backgrounds
+    // of its own priority, so it slots in ahead of the first one it doesn't lose to.
+    let mut order = [0usize; 4];
+    let mut count_bg = 0;
+    for prio in 0..4u8 {
+        for b in 0..4 {
+            if bg_on[b] && l.bg_prio[b] == prio {
+                order[count_bg] = b;
+                count_bg += 1;
+            }
+        }
+    }
+    let order = &order[..count_bg];
+
+    // The colour of the pixel at `x`, in full: windows, the two topmost layers, and any blending.
+    let pixel = |x: usize| -> u16 {
         // Which layers (bits 0-4) and effects (bit 5) are enabled at this pixel.
         let mask = if win_on == 0 {
             0x3F
@@ -485,23 +517,27 @@ fn compose(e: &Engine, dispcnt: u32, line: usize, l: &Layers, bg_on: [bool; 4], 
         // Collect the two topmost visible pixels (layer 4 = sprite, 5 = backdrop).
         let mut found: [(u16, usize); 2] = [(backdrop, 5), (backdrop, 5)];
         let mut count = 0;
-        'search: for prio in 0..4u8 {
-            if mask & 0x10 != 0 && l.obj[x] & OPAQUE != 0 && l.obj_prio[x] == prio {
-                found[count] = (l.obj[x] & 0x7FFF, 4);
+        let mut obj = (mask & 0x10 != 0 && l.obj[x] & OPAQUE != 0).then(|| (l.obj_prio[x], l.obj[x] & 0x7FFF));
+        for &b in order {
+            if mask & (1 << b) == 0 || l.bg[b][x] & OPAQUE == 0 {
+                continue;
+            }
+            if let Some((_, color)) = obj.filter(|&(prio, _)| prio <= l.bg_prio[b]) {
+                found[count] = (color, 4);
                 count += 1;
+                obj = None;
                 if count == 2 {
-                    break 'search;
+                    break;
                 }
             }
-            for b in 0..4 {
-                if bg_on[b] && mask & (1 << b) != 0 && l.bg_prio[b] == prio && l.bg[b][x] & OPAQUE != 0 {
-                    found[count] = (l.bg[b][x] & 0x7FFF, b);
-                    count += 1;
-                    if count == 2 {
-                        break 'search;
-                    }
-                }
+            found[count] = (l.bg[b][x] & 0x7FFF, b);
+            count += 1;
+            if count == 2 {
+                break;
             }
+        }
+        if let (Some((_, color)), true) = (obj, count < 2) {
+            found[count] = (color, 4);
         }
         let (top, top_layer) = found[0];
         let (below, below_layer) = found[1];
@@ -510,7 +546,7 @@ fn compose(e: &Engine, dispcnt: u32, line: usize, l: &Layers, bg_on: [bool; 4], 
         let effects_on = mask & 0x20 != 0;
 
         let semi = top_layer == 4 && l.obj_semi[x];
-        let color = if top_layer == 0 && l.bg0_3d && l.bg0_alpha[x] < 31 {
+        if top_layer == 0 && l.bg0_3d && l.bg0_alpha[x] < 31 {
             // Translucent 3D pixels blend with whatever is behind them.
             blend_3d(top, below, l.bg0_alpha[x] as u32)
         } else if semi && second_target && effects_on {
@@ -524,8 +560,38 @@ fn compose(e: &Engine, dispcnt: u32, line: usize, l: &Layers, bg_on: [bool; 4], 
             }
         } else {
             top
+        }
+    };
+
+    if win_on != 0 || effect != 0 {
+        for x in 0..WIDTH {
+            out[x] = bgr555_to_rgb(pixel(x));
+        }
+        return;
+    }
+    // No windows and no brightness or blend effect: the top pixel is the answer, unless it is
+    // a translucent sprite or 3D pixel, which blend regardless.
+    for x in 0..WIDTH {
+        let obj = l.obj[x];
+        let obj_prio = if obj & OPAQUE != 0 { l.obj_prio[x] } else { u8::MAX };
+        let mut top = None;
+        for &b in order {
+            if obj_prio <= l.bg_prio[b] {
+                break;
+            }
+            let c = l.bg[b][x];
+            if c & OPAQUE != 0 {
+                top = Some((c, b));
+                break;
+            }
+        }
+        let (color, layer) = top.unwrap_or(if obj_prio != u8::MAX { (obj, 4) } else { (backdrop, 5) });
+        let translucent = match layer {
+            4 => l.obj_semi[x],
+            0 => l.bg0_3d && l.bg0_alpha[x] < 31,
+            _ => false,
         };
-        out[x] = bgr555_to_rgb(color);
+        out[x] = bgr555_to_rgb(if translucent { pixel(x) } else { color & 0x7FFF });
     }
 }
 
@@ -711,5 +777,145 @@ mod tests {
         assert_eq!(line[4], 0);
         assert_eq!(line[10], 0x00FF00);
         assert_eq!(line[20], 0);
+    }
+
+    /// The original per-pixel layer search, kept to check the faster one against.
+    fn compose_reference(e: &Engine, dispcnt: u32, line: usize, l: &Layers, bg_on: [bool; 4], out: &mut [u32]) {
+        let win_on = dispcnt >> 13 & 7;
+        let win_in = e.reg(0x48);
+        let win_out = e.reg(0x4A);
+        let win_rect = |n: usize| {
+            let h = e.reg(0x40 + n * 2);
+            let v = e.reg(0x44 + n * 2);
+            ((h >> 8) as usize, (h & 0xFF) as usize, (v >> 8) as usize, (v & 0xFF) as usize)
+        };
+        let (w0, w1) = (win_rect(0), win_rect(1));
+        let win0_line = win_on & 1 != 0 && in_window_range(line, w0.2, w0.3);
+        let win1_line = win_on & 2 != 0 && in_window_range(line, w1.2, w1.3);
+
+        let bldcnt = e.reg(0x50) as usize;
+        let effect = (bldcnt >> 6) & 3;
+        let alpha = e.reg(0x52);
+        let (eva, evb) = ((alpha & 0x1F).min(16) as u32, ((alpha >> 8) & 0x1F).min(16) as u32);
+        let evy = (e.reg(0x54) & 0x1F).min(16) as u32;
+        let backdrop = e.palette_color(0);
+
+        for x in 0..WIDTH {
+            // Which layers (bits 0-4) and effects (bit 5) are enabled at this pixel.
+            let mask = if win_on == 0 {
+                0x3F
+            } else if win0_line && in_window_range(x, w0.0, w0.1) {
+                win_in & 0x3F
+            } else if win1_line && in_window_range(x, w1.0, w1.1) {
+                (win_in >> 8) & 0x3F
+            } else if win_on & 4 != 0 && l.obj_win[x] {
+                (win_out >> 8) & 0x3F
+            } else {
+                win_out & 0x3F
+            } as usize;
+
+            // Collect the two topmost visible pixels (layer 4 = sprite, 5 = backdrop).
+            let mut found: [(u16, usize); 2] = [(backdrop, 5), (backdrop, 5)];
+            let mut count = 0;
+            'search: for prio in 0..4u8 {
+                if mask & 0x10 != 0 && l.obj[x] & OPAQUE != 0 && l.obj_prio[x] == prio {
+                    found[count] = (l.obj[x] & 0x7FFF, 4);
+                    count += 1;
+                    if count == 2 {
+                        break 'search;
+                    }
+                }
+                for b in 0..4 {
+                    if bg_on[b] && mask & (1 << b) != 0 && l.bg_prio[b] == prio && l.bg[b][x] & OPAQUE != 0 {
+                        found[count] = (l.bg[b][x] & 0x7FFF, b);
+                        count += 1;
+                        if count == 2 {
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            let (top, top_layer) = found[0];
+            let (below, below_layer) = found[1];
+            let first_target = bldcnt >> top_layer & 1 != 0;
+            let second_target = bldcnt >> 8 >> below_layer & 1 != 0;
+            let effects_on = mask & 0x20 != 0;
+
+            let semi = top_layer == 4 && l.obj_semi[x];
+            let color = if top_layer == 0 && l.bg0_3d && l.bg0_alpha[x] < 31 {
+                // Translucent 3D pixels blend with whatever is behind them.
+                blend_3d(top, below, l.bg0_alpha[x] as u32)
+            } else if semi && second_target && effects_on {
+                blend_alpha(top, below, eva, evb)
+            } else if effects_on && first_target {
+                match effect {
+                    1 if second_target => blend_alpha(top, below, eva, evb),
+                    2 => fade(top, evy, true),
+                    3 => fade(top, evy, false),
+                    _ => top,
+                }
+            } else {
+                top
+            };
+            out[x] = bgr555_to_rgb(color);
+        }
+    }
+
+    #[test]
+    fn composition_matches_the_plain_layer_search() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as u32
+        };
+        for case in 0..3000 {
+            let mut fixture = Fixture::new();
+            for b in fixture.regs.iter_mut().chain(fixture.palette.iter_mut()) {
+                *b = next() as u8;
+            }
+            // Mostly the simple cases: no windows, no effects.
+            let mut dispcnt = next() & 0xE000_FF08;
+            if case % 3 != 0 {
+                dispcnt &= !0xE000;
+            }
+            if case % 4 != 0 {
+                fixture.regs[0x50] &= 0x3F;
+                fixture.regs[0x51] &= 0x3F;
+            }
+            let mut layers = Layers {
+                bg: [[0; WIDTH]; 4],
+                bg_prio: [0; 4],
+                obj: [0; WIDTH],
+                obj_prio: [4; WIDTH],
+                obj_semi: [false; WIDTH],
+                obj_win: [false; WIDTH],
+                bg0_3d: case % 7 == 0,
+                bg0_alpha: [31; WIDTH],
+            };
+            let bg_on = [next() % 4 != 0, next() % 4 != 0, next() % 4 != 0, next() % 4 != 0];
+            for b in 0..4 {
+                layers.bg_prio[b] = (next() % 4) as u8;
+                for x in 0..WIDTH {
+                    layers.bg[b][x] = if next() % 3 == 0 { 0 } else { OPAQUE | (next() & 0x7FFF) as u16 };
+                }
+            }
+            for x in 0..WIDTH {
+                if next() % 3 == 0 {
+                    layers.obj[x] = OPAQUE | (next() & 0x7FFF) as u16;
+                    layers.obj_prio[x] = (next() % 4) as u8;
+                    layers.obj_semi[x] = case % 5 == 0 && next() % 4 == 0;
+                }
+                layers.obj_win[x] = next() % 4 == 0;
+                layers.bg0_alpha[x] = (next() % 32) as u8;
+            }
+            let line = (next() % 192) as usize;
+            let engine = fixture.engine();
+            let (mut fast, mut slow) = ([0u32; WIDTH], [0u32; WIDTH]);
+            compose(&engine, dispcnt, line, &layers, bg_on, &mut fast);
+            compose_reference(&engine, dispcnt, line, &layers, bg_on, &mut slow);
+            assert!(fast == slow, "case {case}: pictures differ");
+        }
     }
 }

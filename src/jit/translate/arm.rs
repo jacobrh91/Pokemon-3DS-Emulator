@@ -34,8 +34,12 @@ impl<const C: usize> Translator<C> {
     fn try_native(&mut self, instr: u32, index: u32) -> bool {
         let group = instr >> 25 & 7;
         let supported = match group {
+            0b000 if instr & 0xF0 == 0x90 => multiply_supported(instr),
+            0b000 if instr & 0x90 == 0x90 => halfword_supported(instr),
+            0b000 if instr & 0x0FFF_0FFF == 0x010F_0000 => instr >> 12 & 15 != 15,
             0b000 | 0b001 => data_processing_supported(instr),
             0b010 | 0b011 => transfer_supported(instr),
+            0b100 => block_supported(instr),
             _ => false,
         };
         if !supported {
@@ -48,10 +52,18 @@ impl<const C: usize> Translator<C> {
             self.a.b_cond(cond ^ 1, skip);
             (skip, self.mem)
         });
-        if group < 2 {
-            self.arm_data_processing(instr);
-        } else {
-            self.arm_transfer(instr, index);
+        match group {
+            0 if instr & 0xF0 == 0x90 => self.arm_multiply(instr),
+            0 if instr & 0x90 == 0x90 => self.arm_halfword_transfer(instr, index),
+            0 if instr & 0x0FFF_0FFF == 0x010F_0000 => self.read_cpsr(instr >> 12 & 15),
+            0 | 1 => self.arm_data_processing(instr),
+            4 => {
+                let list = instr & 0xFFFF;
+                let (pre, up) = (instr & (1 << 24) != 0, instr & (1 << 23) != 0);
+                let load = instr & (1 << 20) != 0;
+                self.block_transfer(load, instr >> 16 & 15, list, up, pre, instr & (1 << 21) != 0, index);
+            }
+            _ => self.arm_transfer(instr, index),
         }
         if let Some((skip, mem_before)) = skip {
             // Both paths must agree on where the flags are.
@@ -79,20 +91,10 @@ impl<const C: usize> Translator<C> {
         }
     }
 
-    fn arm_transfer(&mut self, instr: u32, index: u32) {
-        let pre = instr & (1 << 24) != 0;
-        let up = instr & (1 << 23) != 0;
-        let byte = instr & (1 << 22) != 0;
-        let load = instr & (1 << 20) != 0;
-        let rn = instr >> 16 & 15;
-        let rd = instr >> 12 & 15;
-        let writeback = !pre || instr & (1 << 21) != 0;
-
-        self.ensure_mem();
-        let offset_imm = (instr >> 25 & 1 == 0).then_some(instr & 0xFFF);
-        if offset_imm.is_none() {
-            self.shifted_register(instr, false);
-        }
+    /// The address of a single transfer: base register `rn` moved by the offset (a constant,
+    /// or the value in `T_B`) before the access if `pre`, otherwise after. With `writeback`,
+    /// `SAVED` ends up holding the new base. Returns the host register with the address.
+    fn transfer_address(&mut self, pre: bool, up: bool, rn: u32, writeback: bool, offset_imm: Option<u32>) -> Reg {
         let base_const = (rn == 15).then(|| self.pc_read());
         if base_const.is_none() {
             self.load_reg(T_A, rn);
@@ -119,6 +121,72 @@ impl<const C: usize> Translator<C> {
             moved(self, SAVED);
             T_A
         };
+        addr
+    }
+
+    /// MUL and MLA.
+    fn arm_multiply(&mut self, instr: u32) {
+        let set = instr & (1 << 20) != 0;
+        if set {
+            self.ensure_host();
+        }
+        self.load_reg(T_A, instr & 15);
+        self.load_reg(T_B, instr >> 8 & 15);
+        self.a.mul(T_TMP, T_A, T_B);
+        if instr & (1 << 21) != 0 {
+            self.load_reg(T_C, instr >> 12 & 15);
+            self.a.addsub_reg(false, false, T_TMP, T_TMP, T_C);
+        }
+        if set {
+            self.logical_flags(Carry::Unchanged);
+        }
+        self.store_reg(T_TMP, instr >> 16 & 15);
+    }
+
+    /// LDRH, STRH, LDRSB and LDRSH.
+    fn arm_halfword_transfer(&mut self, instr: u32, index: u32) {
+        let pre = instr & (1 << 24) != 0;
+        let up = instr & (1 << 23) != 0;
+        let load = instr & (1 << 20) != 0;
+        let rn = instr >> 16 & 15;
+        let rd = instr >> 12 & 15;
+        let writeback = !pre || instr & (1 << 21) != 0;
+        self.ensure_mem();
+        let offset_imm = (instr & (1 << 22) != 0).then(|| instr >> 4 & 0xF0 | instr & 0xF);
+        if offset_imm.is_none() {
+            self.load_reg(T_B, instr & 15);
+        }
+        let addr = self.transfer_address(pre, up, rn, writeback, offset_imm);
+        let kind = match instr >> 5 & 3 {
+            1 => Access::Half,
+            2 => Access::ByteSigned,
+            _ => Access::HalfSigned,
+        };
+        self.access(kind, load, rd, addr, writeback.then_some(rn), index);
+    }
+
+    /// MRS rd, CPSR
+    fn read_cpsr(&mut self, rd: u32) {
+        self.ensure_mem();
+        self.a.ldr_w(T_TMP, CPU, cpsr_off());
+        self.store_reg(T_TMP, rd);
+    }
+
+    fn arm_transfer(&mut self, instr: u32, index: u32) {
+        let pre = instr & (1 << 24) != 0;
+        let up = instr & (1 << 23) != 0;
+        let byte = instr & (1 << 22) != 0;
+        let load = instr & (1 << 20) != 0;
+        let rn = instr >> 16 & 15;
+        let rd = instr >> 12 & 15;
+        let writeback = !pre || instr & (1 << 21) != 0;
+
+        self.ensure_mem();
+        let offset_imm = (instr >> 25 & 1 == 0).then_some(instr & 0xFFF);
+        if offset_imm.is_none() {
+            self.shifted_register(instr, false);
+        }
+        let addr = self.transfer_address(pre, up, rn, writeback, offset_imm);
         let kind = if byte { Access::Byte } else { Access::Word };
         self.access(kind, load, rd, addr, writeback.then_some(rn), index);
     }
@@ -156,6 +224,31 @@ fn data_processing_supported(instr: u32) -> bool {
     }
     // Register operand: only shifts by a constant, and not rotate-right-with-extend.
     instr & (1 << 4) == 0 && !(instr >> 5 & 3 == 3 && instr >> 7 & 31 == 0)
+}
+
+fn multiply_supported(instr: u32) -> bool {
+    // MUL / MLA, with no long forms and no R15 anywhere.
+    instr & 0x0FC0_0000 == 0 && [16, 12, 8, 0].iter().all(|&shift| instr >> shift & 15 != 15)
+}
+
+fn halfword_supported(instr: u32) -> bool {
+    let load = instr & (1 << 20) != 0;
+    let kind = instr >> 5 & 3;
+    let rn = instr >> 16 & 15;
+    let rd = instr >> 12 & 15;
+    let writeback = instr & (1 << 24) == 0 || instr & (1 << 21) != 0;
+    // Not SWP or multiplies (kind 0), nor the double-word forms, which are stores of kind 2 and 3.
+    if kind == 0 || (!load && kind != 1) || rd == 15 || (rn == 15 && writeback) {
+        return false;
+    }
+    instr & (1 << 22) != 0 || instr & 15 != 15
+}
+
+fn block_supported(instr: u32) -> bool {
+    let load = instr & (1 << 20) != 0;
+    let list = instr & 0xFFFF;
+    // No user-bank or CPSR-restoring forms, no empty list, and no loads of the PC.
+    instr & (1 << 22) == 0 && list != 0 && instr >> 16 & 15 != 15 && !(load && list & 0x8000 != 0)
 }
 
 fn transfer_supported(instr: u32) -> bool {

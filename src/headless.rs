@@ -16,10 +16,12 @@ pub struct HeadlessOptions<'a> {
     pub load_state: Option<&'a str>,
     pub save_state: Option<&'a str>,
     pub script: &'a [ScriptedInput],
+    pub cheats: ds_emulator::cheats::Cheats,
 }
 
-pub fn run_headless(cart: Cartridge, rom_path: &str, frames: u64, opts: &HeadlessOptions) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_headless(cart: Cartridge, rom_path: &str, frames: u64, opts: HeadlessOptions) -> Result<(), Box<dyn std::error::Error>> {
     let mut nds = new_console(cart, rom_path);
+    nds.cheats = opts.cheats;
     if let Some(path) = opts.load_state {
         nds.load_state(&std::fs::read(path)?)?;
     }

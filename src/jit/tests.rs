@@ -53,7 +53,7 @@ const DATA_SIZE: u32 = 0x1_0000;
 fn random_arm(rng: &mut Rng) -> u32 {
     let cond = if rng.below(3) == 0 { rng.below(14) } else { 14 };
     let (rn, rd, rm) = (rng.below(16), rng.below(15), rng.below(16));
-    let word = match rng.below(10) {
+    let word = match rng.below(15) {
         0..=2 => {
             // data processing, rotated immediate
             let (op, s) = (rng.below(16), rng.below(2));
@@ -76,6 +76,24 @@ fn random_arm(rng: &mut Rng) -> u32 {
             };
             0b01 << 26 | flags | rn << 16 | rd << 12 | offset
         }
+        9..=10 => {
+            // halfword and signed transfers (and the double-word ones, which stay interpreted)
+            let (p, u, w, l) = (rng.below(2), rng.below(2), rng.below(2), rng.below(2));
+            let kind = 1 + rng.below(3);
+            let offset = if rng.below(2) == 0 { 1 << 22 | rng.below(3) << 8 | rng.below(16) } else { rm };
+            p << 24 | u << 23 | w << 21 | l << 20 | rn << 16 | rd << 12 | 1 << 7 | kind << 5 | 1 << 4 | offset
+        }
+        11..=12 => {
+            // load / store multiple
+            let (p, u, w, l) = (rng.below(2), rng.below(2), rng.below(2), rng.below(2));
+            let s = (rng.below(8) == 0) as u32;
+            let list = (rng.next() & rng.next() & 0xFFFF) | (rng.below(2) << rng.below(16));
+            0b100 << 25 | p << 24 | u << 23 | s << 22 | w << 21 | l << 20 | rn << 16 | list
+        }
+        13 => match rng.below(2) {
+            0 => rng.below(4) << 20 | rd << 16 | rng.below(16) << 12 | rng.below(16) << 8 | 0x90 | rm,
+            _ => 0x010F_0000 | rng.below(2) << 22 | rd << 12,
+        },
         _ => match rng.below(4) {
             0 => 0x012F_FF10 | rm,
             1 => 0x012F_FF30 | rm,
@@ -179,7 +197,7 @@ fn compare_blocks<const C: usize>(thumb: bool, cases: u32) {
 
         jit.flush(&mut hw_j);
         let block = jit.lookup::<C>(&mut hw_j, CODE | thumb as u32).expect("block");
-        let ran = jit.run(block, &mut cpu_j, &mut hw_j);
+        let ran = jit.run(block, &mut cpu_j, &mut hw_j, 1 << 20);
         for _ in 0..ran {
             step::<C>(&mut cpu_i, &mut hw_i);
         }
@@ -235,4 +253,66 @@ fn compiling_changes_nothing_on_the_real_game() {
         assert_eq!(fast.framebuffer(), plain.framebuffer(), "picture differs at frame {frame}");
         assert_eq!(fast.take_audio(), plain.take_audio(), "audio differs at frame {frame}");
     }
+}
+
+/// Blocks that lead on to one another run in one go, and stop doing so when the second is overwritten.
+#[test]
+fn chained_blocks_unlink_when_the_target_changes() {
+    const MOV_R0_1: u32 = 0xE3A0_0001;
+    const MOV_R1_2: u32 = 0xE3A0_1002;
+    const BRANCH_AHEAD: u32 = 0xEAFF_FFFF; // to the next instruction
+    const BRANCH_HERE: u32 = 0xEAFF_FFFE;
+    let words = [MOV_R0_1, BRANCH_AHEAD, MOV_R1_2, BRANCH_HERE];
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let (mut hw, mut cpu) = machine::<ARM9>(7, &bytes);
+    let mut jit = Jit::default();
+    jit.flush(&mut hw);
+    let second = CODE + 8;
+    let start = |cpu: &mut Cpu| {
+        cpu.regs = [0; 16];
+        cpu.regs[15] = CODE;
+        cpu.cpsr = 0x1F;
+    };
+
+    let first_block = jit.lookup::<ARM9>(&mut hw, CODE).expect("first block");
+    jit.lookup::<ARM9>(&mut hw, second).expect("second block");
+    start(&mut cpu);
+    assert_eq!(jit.run(first_block, &mut cpu, &mut hw, 100), 4);
+    assert_eq!((cpu.regs[0], cpu.regs[1], cpu.regs[15]), (1, 2, CODE + 12));
+
+    // Not when there isn't time for the second block.
+    start(&mut cpu);
+    assert_eq!(jit.run(first_block, &mut cpu, &mut hw, 3), 2);
+    assert_eq!((cpu.regs[1], cpu.regs[15]), (0, second));
+
+    // Overwrite the second block's code.
+    hw.write(ARM9, second, 4, 0xE3A0_1003);
+    jit.process(&mut hw);
+    start(&mut cpu);
+    assert_eq!(jit.run(first_block, &mut cpu, &mut hw, 100), 2);
+    assert_eq!((cpu.regs[1], cpu.regs[15]), (0, second));
+
+    // A fresh second block is linked in again.
+    let again = jit.lookup::<ARM9>(&mut hw, second).expect("recompiled block");
+    assert_ne!(again.entry, 0);
+    start(&mut cpu);
+    assert_eq!(jit.run(first_block, &mut cpu, &mut hw, 100), 4);
+    assert_eq!(cpu.regs[1], 3);
+}
+
+#[test]
+fn a_block_ends_before_a_hooked_address_and_never_starts_on_one() {
+    let (mut hw, _) = machine::<ARM9>(7, &[]);
+    // Four ARM instructions: `mov r0, r0`.
+    for i in 0..4 {
+        hw.write(ARM9, CODE + 4 * i, 4, 0xE1A0_0000);
+    }
+    let mut jit = Jit::default();
+    let whole = jit.lookup::<ARM9>(&mut hw, CODE).expect("a block");
+    assert!(whole.len >= 4);
+    jit.set_hooks(vec![CODE + 8], &mut hw);
+    let cut = jit.lookup::<ARM9>(&mut hw, CODE).expect("a block");
+    assert_eq!(cut.len, 2, "stops before the hooked instruction");
+    assert!(jit.lookup::<ARM9>(&mut hw, CODE + 8).is_none(), "the interpreter runs the hooked one");
+    assert!(jit.lookup::<ARM9>(&mut hw, CODE + 12).is_some());
 }

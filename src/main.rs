@@ -4,12 +4,13 @@ mod headless;
 use std::process::ExitCode;
 
 use ds_emulator::cartridge::Cartridge;
+use ds_emulator::cheats::{Cheats, Perfect, WildMon};
 use ds_emulator::frontend;
 
 use files::{new_console, save_path, state_path};
 use headless::{HeadlessOptions, parse_script_input, run_headless};
 
-const USAGE: &str = "usage: ds_emulator [--info] [--frames <n> [--screenshot <file.png>] [--wav <file.wav>] [--load-state <file>] [--save-state <file>] [--tap <x>,<y>@<frame>]... [--press <button>@<frame>]...] <rom.nds>";
+const USAGE: &str = "usage: ds_emulator [--info] [--frames <n> [--screenshot <file.png>] [--wav <file.wav>] [--load-state <file>] [--save-state <file>] [--tap <x>,<y>@<frame>]... [--press <button>@<frame>]...] [--wild <species>@<level>] [--perfect <wild|opponents|both>] <rom.nds>";
 
 fn main() -> ExitCode {
     match run() {
@@ -29,6 +30,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut load_state = None;
     let mut save_state = None;
     let mut script = Vec::new();
+    let mut cheats = Cheats::default();
     let mut rom_path = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -41,6 +43,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--save-state" => save_state = Some(args.next().ok_or(USAGE)?),
             "--tap" => script.push(parse_script_input(&args.next().ok_or(USAGE)?, true)?),
             "--press" => script.push(parse_script_input(&args.next().ok_or(USAGE)?, false)?),
+            "--wild" => cheats.wild = Some(parse_wild(&args.next().ok_or(USAGE)?)?),
+            "--perfect" => {
+                let choice = args.next().ok_or(USAGE)?;
+                cheats.perfect = Perfect::from_key(&choice).ok_or_else(|| format!("unknown --perfect choice {choice:?}"))?;
+            }
             _ => rom_path = Some(arg),
         }
     }
@@ -67,17 +74,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cart,
             &rom_path,
             frames,
-            &HeadlessOptions {
+            HeadlessOptions {
                 screenshot: screenshot.as_deref(),
                 wav: wav.as_deref(),
                 load_state: load_state.as_deref(),
                 save_state: save_state.as_deref(),
                 script: &script,
+                cheats,
             },
         );
     }
     let title = h.title.clone();
     let mut nds = new_console(cart, &rom_path);
+    nds.cheats = cheats;
     if std::env::var_os("DS_FLASH_LOG").is_some() {
         nds.hw.backup.command_log = Some(Vec::new());
     }
@@ -85,4 +94,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         nds.load_state(&std::fs::read(path)?)?;
     }
     frontend::run(&mut nds, &title, Some(&save_path(&rom_path)), &state_path(&rom_path))
+}
+
+/// Parse `species@level`.
+fn parse_wild(spec: &str) -> Result<WildMon, Box<dyn std::error::Error>> {
+    let (species, level) = spec.split_once('@').ok_or(USAGE)?;
+    Ok(WildMon::new(species.parse()?, level.parse()?))
 }

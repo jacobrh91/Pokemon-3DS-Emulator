@@ -53,8 +53,17 @@ pub struct Video {
     pub in_hblank: bool,
 }
 
+/// Where compiled code finds the memory it reads and writes directly; set before each run.
+#[derive(Default, Clone, Copy)]
+pub struct FastPtrs {
+    pub main_ram: usize,
+    pub code_map: usize,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Hardware {
+    #[serde(skip)]
+    pub fast: FastPtrs,
     #[serde(skip)]
     pub cart: Cartridge,
     pub main_ram: Vec<u8>,
@@ -77,9 +86,9 @@ pub struct Hardware {
     #[serde(skip)]
     itcm_limit: u32,
     #[serde(skip)]
-    dtcm_lo: u32,
+    pub(crate) dtcm_lo: u32,
     #[serde(skip)]
-    dtcm_len: u32,
+    pub(crate) dtcm_len: u32,
     pub irq: [Irq; 2],
     pub timers: [[Timer; 4]; 2],
     /// Bit `t` set when timer `t` of that CPU is running; derived from `timers`.
@@ -154,6 +163,7 @@ impl Hardware {    pub fn new(cart: Cartridge) -> Hardware {
         Hardware {
             infrared,
             cart,
+            fast: FastPtrs::default(),
             main_ram: vec![0; MAIN_RAM_SIZE],
             shared_wram: vec![0; SHARED_WRAM_SIZE],
             wram7: vec![0; ARM7_WRAM_SIZE],

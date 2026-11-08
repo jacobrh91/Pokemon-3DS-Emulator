@@ -97,14 +97,27 @@ impl<const C: usize> Translator<C> {
                     self.a.add_sub_imm(instr & 0x80 != 0, false, T_TMP, T_A, (instr & 0x7F) * 4);
                     self.store_reg(T_TMP, sp);
                 } else {
-                    self.interpret(instr, index);
+                    let low = instr & 0xFF;
+                    match instr >> 8 & 0xF {
+                        0x4 | 0x5 if instr & 0x1FF != 0 => {
+                            let list = low | (instr >> 8 & 1) << 14;
+                            self.block_transfer(false, sp, list, false, true, true, index);
+                        }
+                        0xC if low != 0 => self.block_transfer(true, sp, low, true, false, true, index),
+                        _ => self.interpret(instr, index),
+                    }
                     // POP with PC in the list returns.
                     return if instr >> 8 & 0xF == 0xD { Flow::Fall } else { Flow::Continue };
                 }
             }
             0b110 => {
                 if instr & (1 << 12) == 0 {
-                    self.interpret(instr, index);
+                    let list = instr & 0xFF;
+                    if list == 0 {
+                        self.interpret(instr, index);
+                    } else {
+                        self.block_transfer(instr & (1 << 11) != 0, instr >> 8 & 7, list, true, false, true, index);
+                    }
                 } else {
                     let cond = instr >> 8 & 0xF;
                     if cond >= 0xE {

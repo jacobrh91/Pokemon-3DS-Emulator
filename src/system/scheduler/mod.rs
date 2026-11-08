@@ -41,6 +41,9 @@ pub struct Nds {
     /// Compiled code for ARM-state programs in main RAM.
     #[serde(skip)]
     pub jit: crate::jit::Jit,
+    /// Built-in cheats for the Pokémon games, which hook routines of the ARM9's code.
+    #[serde(skip)]
+    pub cheats: crate::cheats::Cheats,
 }
 
 fn default_true() -> bool {
@@ -63,6 +66,7 @@ impl Nds {
             idle_skip: true,
             eager_irq: false,
             jit: Default::default(),
+            cheats: Default::default(),
         };
         bios::direct_boot(&mut nds.arm9, &mut nds.arm7, &mut nds.hw);
         nds
@@ -80,6 +84,7 @@ impl Nds {
 
     /// Run one full video frame (263 scanlines).
     pub fn run_frame(&mut self) {
+        self.cheats.refresh(self.frames, &mut self.jit, &mut self.hw);
         for _ in 0..LINES_PER_FRAME {
             self.run_scanline();
         }
@@ -180,6 +185,7 @@ impl Nds {
         // Where the BIOS's vectors sit for this CPU.
         let vector_base = if WHICH == ARM9 { 0xFFFF_0000u32 } else { 0 };
         let jit = &mut self.jit;
+        let cheats = &self.cheats;
         let use_jit = jit.enabled && !eager_irq && !debug && !tracing_io;
         let mut probe = idle::IdleProbe::new();
         let mut previous_pc = u32::MAX;
@@ -232,6 +238,9 @@ impl Nds {
                     continue;
                 }
             }
+            if WHICH == ARM9 && jit.hooks.contains(&pc) {
+                cheats.fire(pc, cpu, hw);
+            }
             if use_jit {
                 if !hw.code_hits.is_empty() || hw.code_flush {
                     jit.process(hw);
@@ -244,7 +253,7 @@ impl Nds {
                         let left = cycles - done;
                         let block = if block.len <= left { Some(block) } else { jit.lookup_short::<WHICH>(hw, key, left) };
                         if let Some(block) = block {
-                            let ran = jit.run(block, cpu, hw);
+                            let ran = jit.run(block, cpu, hw, left);
                             hw.cycles[WHICH] += ran as u64;
                             done += ran;
                             if cpu.halted {

@@ -18,13 +18,14 @@ use translate::MAX_BLOCK;
 
 use crate::cpu::Cpu;
 use crate::system::Hardware;
+use asm::Asm;
 use mem::CodeMemory;
 use std::collections::HashMap;
 
 const TABLE_BITS: usize = 15;
 const CODE_SIZE: usize = 32 << 20;
 
-type BlockFn = unsafe extern "C" fn(*mut Cpu, *mut Hardware) -> u32;
+type BlockFn = unsafe extern "C" fn(*mut Cpu, *mut Hardware, u32) -> u32;
 
 /// A compiled block: `len` instructions starting at `pc`, entered at `entry`. Blocks are
 /// named by their address, with bit 0 set for Thumb code. A `len` of zero marks code
@@ -34,9 +35,20 @@ pub struct Block {
     pc: u32,
     pub len: u32,
     entry: usize,
+    /// Where other blocks jump to run this one without going through the dispatcher.
+    chain: usize,
 }
 
-const EMPTY: Block = Block { pc: u32::MAX, len: 0, entry: 0 };
+const EMPTY: Block = Block { pc: u32::MAX, len: 0, entry: 0, chain: 0 };
+
+/// A jump in compiled code that is aimed at another block once that exists.
+#[derive(Clone, Copy)]
+struct Site {
+    /// Address of the branch instruction.
+    at: usize,
+    /// Where it goes when its target is gone: the stub that returns to the dispatcher.
+    stub: usize,
+}
 
 struct Cache {
     /// Direct-mapped front for the map.
@@ -73,11 +85,16 @@ pub struct Jit {
     caches: [Cache; 2],
     /// For each page of main RAM holding compiled code, the blocks made from it.
     pages: HashMap<u32, Vec<(usize, u32)>>,
+    /// For each block (by CPU and address) the jumps that lead to it.
+    incoming: HashMap<(usize, u32), Vec<Site>>,
+    /// Addresses (ARM9) where the emulator has to take control before the instruction runs:
+    /// no block starts or continues through them.
+    pub hooks: Vec<u32>,
 }
 
 impl Default for Jit {
     fn default() -> Jit {
-        Jit { enabled: true, code: None, caches: [Cache::new(), Cache::new()], pages: HashMap::new() }
+        Jit { enabled: true, code: None, caches: [Cache::new(), Cache::new()], pages: HashMap::new(), incoming: HashMap::new(), hooks: Vec::new() }
     }
 }
 
@@ -90,11 +107,20 @@ impl Jit {
             cache.table.fill(EMPTY);
         }
         self.pages.clear();
+        self.incoming.clear();
         hw.code_map.fill(0);
         hw.code_hits.clear();
         hw.code_flush = false;
         if let Some(code) = &mut self.code {
             code.reset();
+        }
+    }
+
+    /// Replace the hooked addresses, dropping the compiled code if they changed.
+    pub fn set_hooks(&mut self, hooks: Vec<u32>, hw: &mut Hardware) {
+        if hooks != self.hooks {
+            self.hooks = hooks;
+            self.flush(hw);
         }
     }
 
@@ -107,6 +133,11 @@ impl Jit {
         for page in std::mem::take(&mut hw.code_hits) {
             for (cpu, pc) in self.pages.remove(&page).unwrap_or_default() {
                 self.caches[cpu].remove(pc);
+                // Whatever jumped into it goes back through the dispatcher.
+                if let (Some(sites), Some(code)) = (self.incoming.get(&(cpu, pc)), &mut self.code) {
+                    let patches: Vec<_> = sites.iter().map(|s| (s.at, Asm::branch_word(s.at, s.stub))).collect();
+                    code.patch(&patches);
+                }
             }
         }
     }
@@ -137,7 +168,7 @@ impl Jit {
     /// A block of at most `max_len` instructions, remembered under its address (when full
     /// length) or under its address and length.
     fn compile<const CPU: usize>(&mut self, hw: &mut Hardware, pc: u32, max_len: u32) -> Block {
-        let none = Block { pc, len: 0, entry: 0 };
+        let none = Block { pc, len: 0, entry: 0, chain: 0 };
         let remember = |cache: &mut Cache, block: Block| {
             if max_len == MAX_BLOCK {
                 cache.map.insert(pc, block);
@@ -145,7 +176,7 @@ impl Jit {
                 cache.short.insert((pc, max_len), block);
             }
         };
-        let Some(compiled) = translate::compile::<CPU>(hw, pc, max_len) else {
+        let Some(compiled) = translate::compile::<CPU>(hw, &self.hooks, pc, max_len) else {
             remember(&mut self.caches[CPU], none);
             return none;
         };
@@ -164,13 +195,38 @@ impl Jit {
                 }
             }
         };
-        let block = Block { pc, len: compiled.len, entry };
+        let block = Block { pc, len: compiled.len, entry, chain: entry + 4 * compiled.chain };
         remember(&mut self.caches[CPU], block);
+        self.link::<CPU>(&compiled, block, max_len == MAX_BLOCK);
         for page in compiled.pages {
             hw.code_map[page as usize] = 1;
             self.pages.entry(page).or_default().push((CPU, pc));
         }
         block
+    }
+
+    /// Aim the jumps out of a new block at the blocks they lead to, and the jumps into it
+    /// (if it can be jumped to) at it.
+    fn link<const CPU: usize>(&mut self, compiled: &translate::Compiled, block: Block, whole: bool) {
+        let Some(code) = &mut self.code else { return };
+        let stub = block.entry + 4 * compiled.bail;
+        let mut patches = Vec::new();
+        for link in &compiled.links {
+            let site = Site { at: block.entry + 4 * link.site, stub };
+            let target = self.caches[CPU].map.get(&link.key).filter(|b| b.len != 0);
+            if let Some(target) = target {
+                patches.push((site.at, Asm::branch_word(site.at, target.chain)));
+            }
+            self.incoming.entry((CPU, link.key)).or_default().push(site);
+        }
+        if whole {
+            for site in self.incoming.get(&(CPU, block.pc)).into_iter().flatten() {
+                patches.push((site.at, Asm::branch_word(site.at, block.chain)));
+            }
+        }
+        if !patches.is_empty() {
+            code.patch(&patches);
+        }
     }
 
     /// A block starting at `pc` that is at most `len` instructions long, for when that is
@@ -183,11 +239,13 @@ impl Jit {
         (block.len != 0).then_some(block)
     }
 
-    /// Run a block; returns the instructions it executed (its cycle cost).
+    /// Run a block, and any blocks it leads on to, for at most `allowed` instructions in
+    /// all; returns the number executed (their cycle cost).
     #[inline(always)]
-    pub fn run(&self, block: Block, cpu: &mut Cpu, hw: &mut Hardware) -> u32 {
+    pub fn run(&self, block: Block, cpu: &mut Cpu, hw: &mut Hardware, allowed: u32) -> u32 {
         let entry: BlockFn = unsafe { std::mem::transmute(block.entry) };
-        unsafe { entry(cpu, hw) }
+        hw.fast = crate::system::FastPtrs { main_ram: hw.main_ram.as_mut_ptr() as usize, code_map: hw.code_map.as_mut_ptr() as usize };
+        unsafe { entry(cpu, hw, allowed) }
     }
 }
 

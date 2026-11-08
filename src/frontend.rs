@@ -18,6 +18,7 @@ use crate::video::gpu::{HEIGHT, WIDTH};
 use fast_forward::{run_fast, run_multiple};
 use input::{KEY_MAP, pointer_state, touch_from_mouse};
 use overlay::badge::{draw_badge, format_speed};
+use overlay::cheat_menu::{CheatMenu, MenuKey};
 use overlay::dock::Dock;
 use saves::{AUTOSAVE_FRAMES, NOTICE_FRAMES, restart, save_if_dirty, state_action, write_flash_log};
 use settings::{load_settings, save_settings};
@@ -44,6 +45,17 @@ fn upscale(picture: &[u32], out: &mut [u32]) {
         bottom.copy_from_slice(top);
     }
 }
+
+/// The keys that drive the cheat menu while it is open.
+const MENU_KEYS: [(Key, MenuKey); 7] = [
+    (Key::Up, MenuKey::Up),
+    (Key::Down, MenuKey::Down),
+    (Key::Left, MenuKey::Left),
+    (Key::Right, MenuKey::Right),
+    (Key::PageUp, MenuKey::PageUp),
+    (Key::PageDown, MenuKey::PageDown),
+    (Key::Enter, MenuKey::Toggle),
+];
 
 /// Set by the Ctrl+C handler so the main loop can exit and save instead of dying mid-write.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -76,7 +88,8 @@ pub fn run(
     window_control::enable_fullscreen(&window);
     let settings_path = state_path.with_extension("settings");
     let mut dock = Dock::new(1.0);
-    load_settings(&settings_path, &mut dock);
+    let mut menu = CheatMenu::new(&nds.cheats);
+    load_settings(&settings_path, &mut dock, &mut menu, &mut nds.cheats);
 
     // The game still runs, silently, if there is no usable audio device.
     let audio = match AudioOutput::new() {
@@ -101,8 +114,24 @@ pub fn run(
     let mut badged = vec![0u32; WIDTH * WINDOW_HEIGHT];
     let mut shown = vec![0u32; SHOWN_WIDTH * SHOWN_HEIGHT];
     while window.is_open() && !INTERRUPTED.load(Ordering::SeqCst) {
+        if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
+            menu.open = !menu.open;
+        }
+        if menu.open {
+            let mut changed = false;
+            for (key, action) in MENU_KEYS {
+                if window.is_key_pressed(key, KeyRepeat::Yes) {
+                    changed |= menu.press(action, &mut nds.cheats);
+                }
+            }
+            if changed {
+                save_settings(&settings_path, &dock, &menu, &nds.cheats);
+            }
+        }
         if window.is_key_pressed(Key::Escape, KeyRepeat::No) {
-            if window_control::is_fullscreen(&window) {
+            if menu.open {
+                menu.open = false;
+            } else if window_control::is_fullscreen(&window) {
                 window_control::toggle_fullscreen(&window);
             } else {
                 break;
@@ -124,7 +153,7 @@ pub fn run(
             next_frame = Instant::now();
         }
         if dock.take_changed() {
-            save_settings(&settings_path, &dock);
+            save_settings(&settings_path, &dock, &menu, &nds.cheats);
         }
 
         for (key, save) in [(Key::Key0, true), (Key::Key1, false)] {
@@ -143,10 +172,15 @@ pub fn run(
             notice_until = 0;
         }
 
-        nds.hw.keys = KEY_MAP.iter().filter(|(key, _)| window.is_key_down(*key)).fold(0, |keys, (_, bit)| keys | bit);
+        // The menu has the keyboard while it is open (Enter is the game's Start button too).
+        nds.hw.keys = if menu.open {
+            0
+        } else {
+            KEY_MAP.iter().filter(|(key, _)| window.is_key_down(*key)).fold(0, |keys, (_, bit)| keys | bit)
+        };
         // A click on the dock is the dock's, not a touch on the screen under it.
         nds.hw.touch = pointer.position.filter(|_| pointer.left_down).and_then(|(x, y)| {
-            if dock.covers(x, y, SHOWN_WIDTH, SHOWN_HEIGHT) {
+            if menu.open || dock.covers(x, y, SHOWN_WIDTH, SHOWN_HEIGHT) {
                 None
             } else {
                 touch_from_mouse((x, y), (SHOWN_WIDTH, SHOWN_HEIGHT))
@@ -195,6 +229,7 @@ pub fn run(
         };
         upscale(picture, &mut shown);
         dock.draw(&mut shown, SHOWN_WIDTH, SHOWN_HEIGHT);
+        menu.draw(&mut shown, SHOWN_WIDTH, SHOWN_HEIGHT, &nds.cheats);
         window.update_with_buffer(&shown, SHOWN_WIDTH, SHOWN_HEIGHT)?;
         last_present = Instant::now();
 
@@ -218,7 +253,7 @@ pub fn run(
     }
     save_if_dirty(nds, save_path);
     write_flash_log(nds);
-    save_settings(&settings_path, &dock);
+    save_settings(&settings_path, &dock, &menu, &nds.cheats);
     Ok(())
 }
 

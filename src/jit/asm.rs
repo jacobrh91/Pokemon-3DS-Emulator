@@ -26,6 +26,8 @@ pub enum Logic {
 /// Condition codes, numbered exactly as in the ARM instruction set.
 pub const COND_EQ: u32 = 0;
 pub const COND_NE: u32 = 1;
+pub const COND_LO: u32 = 3;
+pub const COND_HI: u32 = 8;
 pub const COND_AL: u32 = 14;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -37,6 +39,19 @@ enum Fixup {
     Cond(u32),
     Cb { rt: Reg },
     Tb { rt: Reg },
+}
+
+/// Loads and stores addressed by a base register plus a 64-bit index register.
+#[derive(Clone, Copy)]
+pub enum MemOp {
+    Ldr = 0xB860_0800,
+    Ldrh = 0x7860_0800,
+    Ldrb = 0x3860_0800,
+    Ldrsh = 0x78E0_0800,
+    Ldrsb = 0x38E0_0800,
+    Str = 0xB820_0800,
+    Strh = 0x7820_0800,
+    Strb = 0x3820_0800,
 }
 
 pub struct Asm {
@@ -56,6 +71,11 @@ impl Asm {
 
     pub fn emit(&mut self, word: u32) {
         self.code.push(word);
+    }
+
+    /// Overwrite a word emitted earlier.
+    pub fn set(&mut self, at: usize, word: u32) {
+        self.code[at] = word;
     }
 
     pub fn label(&mut self) -> Label {
@@ -182,6 +202,11 @@ impl Asm {
         self.emit(0x1AC0_2000 | (kind as u32) << 10 | rm << 16 | rn << 5 | rd);
     }
 
+    /// `rd = rn >> 32` for the 64-bit register `rn`.
+    pub fn lsr_x32(&mut self, rd: Reg, rn: Reg) {
+        self.emit(0xD340_FC00 | 32 << 16 | rn << 5 | rd);
+    }
+
     /// Unsigned bitfield extract: `rd = (rn >> lsb) & ((1 << width) - 1)`.
     pub fn ubfx(&mut self, rd: Reg, rn: Reg, lsb: u32, width: u32) {
         self.emit(0x5300_0000 | lsb << 16 | (lsb + width - 1) << 10 | rn << 5 | rd);
@@ -197,6 +222,28 @@ impl Asm {
     pub fn ldr_w(&mut self, rt: Reg, rn: Reg, offset: u32) {
         debug_assert!(offset % 4 == 0 && offset / 4 < 4096);
         self.emit(0xB940_0000 | offset / 4 << 10 | rn << 5 | rt);
+    }
+
+    /// 64-bit load / store with an immediate offset.
+    pub fn ldr_x(&mut self, rt: Reg, rn: Reg, offset: u32) {
+        debug_assert!(offset % 8 == 0 && offset / 8 < 4096);
+        self.emit(0xF940_0000 | offset / 8 << 10 | rn << 5 | rt);
+    }
+
+    pub fn str_x(&mut self, rt: Reg, rn: Reg, offset: u32) {
+        debug_assert!(offset % 8 == 0 && offset / 8 < 4096);
+        self.emit(0xF900_0000 | offset / 8 << 10 | rn << 5 | rt);
+    }
+
+    /// `rt <-> [rn, rm]`, with `rm` scaled by the access size when `scaled`.
+    pub fn mem_reg(&mut self, op: MemOp, rt: Reg, rn: Reg, rm: Reg, scaled: bool) {
+        self.emit(op as u32 | rm << 16 | 0b011 << 13 | (scaled as u32) << 12 | rn << 5 | rt);
+    }
+
+    /// `add rd, rn, #imm` on the full 64-bit registers.
+    pub fn add_imm_x(&mut self, rd: Reg, rn: Reg, imm: u32) {
+        debug_assert!(imm < 4096);
+        self.emit(0x9100_0000 | imm << 10 | rn << 5 | rd);
     }
 
     pub fn str_w(&mut self, rt: Reg, rn: Reg, offset: u32) {
@@ -260,6 +307,12 @@ impl Asm {
     pub fn tbnz(&mut self, rt: Reg, bit: u32, label: Label) {
         let word = 0x3700_0000 | (bit >> 5) << 31 | (bit & 31) << 19;
         self.branch_with(word, label, Fixup::Tb { rt });
+    }
+
+    /// The word for a branch from the instruction at byte address `from` to `to`.
+    pub fn branch_word(from: usize, to: usize) -> u32 {
+        let delta = (to as i64 - from as i64) / 4;
+        0x1400_0000 | (delta as u32 & 0x03FF_FFFF)
     }
 
     pub fn blr(&mut self, rn: Reg) {
